@@ -14,7 +14,7 @@
 #define JSON_FILE_PATH "/data/adb/modules/playintegrityfix/pif.json"
 #define CUSTOM_JSON_FILE_PATH "/data/adb/modules/playintegrityfix/custom.pif.json"
 
-static int verboseLogs = 0;
+static int VERBOSE_LOGS = 0;
 
 static std::map<std::string, std::string> jsonProps;
 
@@ -23,6 +23,8 @@ static std::string unameRelease;
 typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
 
 static std::map<void *, T_Callback> callbacks;
+
+static std::string thisProc;
 
 static void modify_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
     if (cookie == nullptr || name == nullptr || value == nullptr || !callbacks.contains(cookie)) return;
@@ -52,9 +54,9 @@ static void modify_callback(void *cookie, const char *name, const char *value, u
     }
 
     if (oldValue == value) {
-        if (verboseLogs > 99) LOGD("[%s]: %s (unchanged)", name, oldValue);
+        if (VERBOSE_LOGS > 99) LOGD("%s: [%s]: %s (unchanged)", thisProc.c_str(), name, oldValue);
     } else {
-        LOGD("[%s]: %s -> %s", name, oldValue, value);
+        if (VERBOSE_LOGS > 2) LOGD("%s: [%s]: %s -> %s", thisProc.c_str(), name, oldValue, value);
     }
 
     return callbacks[cookie](cookie, name, value, serial);
@@ -76,14 +78,13 @@ static int my_uname_callback(struct utsname *buf) {
     auto ret = o_uname_callback(buf);
 
     if (buf && ret == 0) {
-        const char *value = unameRelease.c_str();
         const char *oldValue = buf->release;
 
-        if (unameRelease.empty() || oldValue == value) {
-            if (verboseLogs > 2) LOGD("[uname_release]: %s (unchanged)", oldValue);
+        if (unameRelease.empty() || strcmp(oldValue, unameRelease.c_str()) == 0) {
+            if (VERBOSE_LOGS > 99) LOGD("%s: [uname_release]: %s (unchanged)", thisProc.c_str(), oldValue);
         } else if (unameRelease.size() < SYS_NMLN) {
-            LOGD("[uname_release]: %s -> %s", oldValue, value);
-            strncpy(buf->release, value, unameRelease.size());
+            if (VERBOSE_LOGS > 2) LOGD("%s: [uname_release]: %s -> %s", thisProc.c_str(), oldValue, unameRelease.c_str());
+            strncpy(buf->release, unameRelease.c_str(), unameRelease.size());
         }
     }
 
@@ -91,23 +92,23 @@ static int my_uname_callback(struct utsname *buf) {
 }
 
 static void doPropHook() {
-    void *handle = DobbySymbolResolver(nullptr, "__system_property_read_callback");
+    void *handle = DobbySymbolResolver("libc.so", "__system_property_read_callback");
     if (handle == nullptr) {
-        LOGD("Couldn't find '__system_property_read_callback' handle");
+        LOGD("%s: Couldn't find '__system_property_read_callback' handle in libc.so", thisProc.c_str());
         return;
     }
-    LOGD("Found '__system_property_read_callback' handle at %p", handle);
+    LOGD("%s: Found libc.so '__system_property_read_callback' handle at %p", thisProc.c_str(), handle);
     DobbyHook(handle, reinterpret_cast<dobby_dummy_func_t>(my_system_property_read_callback),
         reinterpret_cast<dobby_dummy_func_t *>(&o_system_property_read_callback));
 }
 
 static void doUnameHook() {
-    void *handle = DobbySymbolResolver(nullptr, "uname");
+    void *handle = DobbySymbolResolver("libc.so", "uname");
     if (handle == nullptr) {
-        LOGD("Couldn't find 'uname' handle");
+        LOGD("%s: Couldn't find 'uname' handle in libc.so", thisProc.c_str());
         return;
     }
-    LOGD("Found 'uname' handle at %p", handle);
+    LOGD("%s: Found libc.so 'uname' handle at %p", thisProc.c_str(), handle);
     DobbyHook(handle, reinterpret_cast<dobby_dummy_func_t>(my_uname_callback),
         reinterpret_cast<dobby_dummy_func_t *>(&o_uname_callback));
 }
@@ -120,7 +121,7 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        bool isGms = false, isGmsUnstable = false;
+        bool isGms = false, isGmsUnstable = false, isGmsParentOrPersistent = false;
 
         auto rawProcess = env->GetStringUTFChars(args->nice_name, nullptr);
         auto rawDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
@@ -132,11 +133,12 @@ public:
             return;
         }
 
-        std::string_view process(rawProcess);
+        thisProc = std::string(rawProcess);
         std::string_view dir(rawDir);
 
         isGms = dir.ends_with("/com.google.android.gms");
-        isGmsUnstable = process == "com.google.android.gms.unstable";
+        isGmsUnstable = thisProc == "com.google.android.gms.unstable";
+        isGmsParentOrPersistent = thisProc == "com.google.android.gms" || thisProc == "com.google.android.gms.persistent";
 
         env->ReleaseStringUTFChars(args->nice_name, rawProcess);
         env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
@@ -149,7 +151,7 @@ public:
         // We are in GMS now, force unmount
         api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
 
-        if (!isGmsUnstable) {
+        if (!isGmsUnstable && !isGmsParentOrPersistent) {
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
@@ -164,20 +166,20 @@ public:
 
         if (dexSize < 1) {
             close(fd);
-            LOGD("Couldn't read dex file");
+            LOGD("%s: Couldn't read dex file", thisProc.c_str());
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
         if (jsonSize < 1) {
             close(fd);
-            LOGD("Couldn't read json file");
+            LOGD("%s: Couldn't read json file", thisProc.c_str());
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
-        LOGD("Read from file descriptor for 'dex' -> %ld bytes", dexSize);
-        LOGD("Read from file descriptor for 'json' -> %ld bytes", jsonSize);
+        LOGD("%s: Read from file descriptor for 'dex' -> %ld bytes", thisProc.c_str(), dexSize);
+        LOGD("%s: Read from file descriptor for 'json' -> %ld bytes", thisProc.c_str(), jsonSize);
 
         dexVector.resize(dexSize);
         read(fd, dexVector.data(), dexSize);
@@ -195,12 +197,15 @@ public:
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        if (dexVector.empty() || json.empty()) return;
-
+        if (json.empty()) return;
         readJson();
-        doPropHook();
         doUnameHook();
-        inject();
+
+        if (thisProc == "com.google.android.gms.unstable") {
+            if (dexVector.empty()) return;
+            doPropHook();
+            inject();
+        }
 
         dexVector.clear();
         json.clear();
@@ -217,44 +222,44 @@ private:
     nlohmann::json json;
 
     void readJson() {
-        LOGD("JSON contains %d keys!", static_cast<int>(json.size()));
+        LOGD("%s: JSON contains %d keys!", thisProc.c_str(), static_cast<int>(json.size()));
 
-        // Verbose logging if verbose_logs with level number is present
-        if (json.contains("verbose_logs")) {
-            if (!json["verbose_logs"].is_null() && json["verbose_logs"].is_string() && json["verbose_logs"] != "") {
-                verboseLogs = stoi(json["verbose_logs"].get<std::string>());
-                if (verboseLogs > 0) LOGD("Verbose logging (level %d) enabled!", verboseLogs);
+        // Verbose logging if VERBOSE_LOGS with level number is present
+        if (json.contains("VERBOSE_LOGS")) {
+            if (!json["VERBOSE_LOGS"].is_null() && json["VERBOSE_LOGS"].is_string() && json["VERBOSE_LOGS"] != "") {
+                VERBOSE_LOGS = stoi(json["VERBOSE_LOGS"].get<std::string>());
+                if (VERBOSE_LOGS > 0) LOGD("%s: Verbose logging (level %d) enabled!", thisProc.c_str(), VERBOSE_LOGS);
             } else {
-                LOGD("Error parsing verbose_logs!");
+                LOGD("%s: Error parsing VERBOSE_LOGS!", thisProc.c_str());
             }
-            json.erase("verbose_logs");
+            json.erase("VERBOSE_LOGS");
         }
 
         // Parse kernel uname release string as a special case (neither field or property)
         if (json.contains("uname_release")) {
-            if (verboseLogs > 1) LOGD("Parsing uname_release");
+            if (VERBOSE_LOGS > 1) LOGD("%s: Parsing uname_release", thisProc.c_str());
             if (!json["uname_release"].is_null() && json["uname_release"].is_string() && json["uname_release"] != "") {
                 unameRelease = json["uname_release"].get<std::string>();
             } else {
-                LOGD("Error parsing uname_release!");
+                LOGD("%s: Error parsing uname_release!", thisProc.c_str());
             }
             json.erase("uname_release");
         }
 
         std::vector<std::string> eraseKeys;
         for (auto &jsonList: json.items()) {
-            if (verboseLogs > 1) LOGD("Parsing %s", jsonList.key().c_str());
+            if (VERBOSE_LOGS > 1) LOGD("%s: Parsing %s", thisProc.c_str(), jsonList.key().c_str());
             if (jsonList.key().find_first_of("*.") != std::string::npos) {
                 // Name contains . or * (wildcard) so assume real property name
                 if (!jsonList.value().is_null() && jsonList.value().is_string()) {
                     if (jsonList.value() == "") {
-                        LOGD("%s is empty, skipping", jsonList.key().c_str());
+                        LOGD("%s: %s is empty, skipping", thisProc.c_str(), jsonList.key().c_str());
                     } else {
-                        if (verboseLogs > 0) LOGD("Adding '%s' to properties list", jsonList.key().c_str());
+                        if (VERBOSE_LOGS > 0) LOGD("%s: Adding '%s' to properties list", thisProc.c_str(), jsonList.key().c_str());
                         jsonProps[jsonList.key()] = jsonList.value();
                     }
                 } else {
-                    LOGD("Error parsing %s!", jsonList.key().c_str());
+                    LOGD("%s: Error parsing %s!", thisProc.c_str(), jsonList.key().c_str());
                 }
                 eraseKeys.push_back(jsonList.key());
             }
@@ -266,32 +271,32 @@ private:
     }
 
     void inject() {
-        LOGD("JNI: Getting system classloader");
+        LOGD("%s: JNI: Getting system classloader", thisProc.c_str());
         auto clClass = env->FindClass("java/lang/ClassLoader");
         auto getSystemClassLoader = env->GetStaticMethodID(clClass, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
         auto systemClassLoader = env->CallStaticObjectMethod(clClass, getSystemClassLoader);
 
-        LOGD("JNI: Creating module classloader");
+        LOGD("%s: JNI: Creating module classloader", thisProc.c_str());
         auto dexClClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
         auto dexClInit = env->GetMethodID(dexClClass, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
         auto buffer = env->NewDirectByteBuffer(dexVector.data(), static_cast<jlong>(dexVector.size()));
         auto dexCl = env->NewObject(dexClClass, dexClInit, buffer, systemClassLoader);
 
-        LOGD("JNI: Loading module class");
+        LOGD("%s: JNI: Loading module class", thisProc.c_str());
         auto loadClass = env->GetMethodID(clClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
         auto entryClassName = env->NewStringUTF("es.chiteroman.playintegrityfix.EntryPoint");
         auto entryClassObj = env->CallObjectMethod(dexCl, loadClass, entryClassName);
 
         auto entryClass = (jclass) entryClassObj;
 
-        LOGD("JNI: Sending JSON");
+        LOGD("%s: JNI: Sending JSON", thisProc.c_str());
         auto receiveJson = env->GetStaticMethodID(entryClass, "receiveJson", "(Ljava/lang/String;)V");
         auto javaStr = env->NewStringUTF(json.dump().c_str());
         env->CallStaticVoidMethod(entryClass, receiveJson, javaStr);
 
-        LOGD("JNI: Calling init");
+        LOGD("%s: JNI: Calling init", thisProc.c_str());
         auto entryInit = env->GetStaticMethodID(entryClass, "init", "(I)V");
-        env->CallStaticVoidMethod(entryClass, entryInit, verboseLogs);
+        env->CallStaticVoidMethod(entryClass, entryInit, VERBOSE_LOGS);
     }
 };
 
