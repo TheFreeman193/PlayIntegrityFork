@@ -25,6 +25,7 @@ typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
 static std::map<void *, T_Callback> callbacks;
 
 static std::string thisProc;
+static bool isGms;
 
 static void modify_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
     if (cookie == nullptr || name == nullptr || value == nullptr || !callbacks.contains(cookie)) return;
@@ -91,6 +92,20 @@ static int my_uname_callback(struct utsname *buf) {
     return ret;
 }
 
+static const std::string hardUname = "4.4.310-constant";
+static int (*o_const_uname_callback)(struct utsname *);
+static int const_uname_callback(struct utsname *buf) {
+    auto ret = o_const_uname_callback(buf);
+
+    if (buf && ret == 0) {
+        const char *oldValue = buf->release;
+        if (VERBOSE_LOGS > 2) LOGD("%s: [uname_release]: %s -> %s (constant)", thisProc.c_str(), oldValue, hardUname.c_str());
+        strncpy(buf->release, hardUname.c_str(), hardUname.size());
+    }
+
+    return ret;
+}
+
 static void doPropHook() {
     void *handle = DobbySymbolResolver("libc.so", "__system_property_read_callback");
     if (handle == nullptr) {
@@ -113,6 +128,17 @@ static void doUnameHook() {
         reinterpret_cast<dobby_dummy_func_t *>(&o_uname_callback));
 }
 
+static void doConstUnameHook() {
+    void *handle = DobbySymbolResolver("libc.so", "uname");
+    if (handle == nullptr) {
+        LOGD("%s: Couldn't find 'uname' handle in libc.so (constant)", thisProc.c_str());
+        return;
+    }
+    LOGD("%s: Found libc.so 'uname' handle at %p (constant)", thisProc.c_str(), handle);
+    DobbyHook(handle, reinterpret_cast<dobby_dummy_func_t>(const_uname_callback),
+        reinterpret_cast<dobby_dummy_func_t *>(&o_const_uname_callback));
+}
+
 class PlayIntegrityFix : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
@@ -121,7 +147,7 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        bool isGms = false, isGmsUnstable = false, isGmsParentOrPersistent = false;
+        bool isGmsUnstable = false, isGmsProcess = false;
 
         auto rawProcess = env->GetStringUTFChars(args->nice_name, nullptr);
         auto rawDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
@@ -138,21 +164,24 @@ public:
 
         isGms = dir.ends_with("/com.google.android.gms");
         isGmsUnstable = thisProc == "com.google.android.gms.unstable";
-        isGmsParentOrPersistent = thisProc == "com.google.android.gms" || thisProc == "com.google.android.gms.persistent";
+        isGmsProcess = isGmsUnstable ||
+            thisProc == "com.google.android.gms" ||
+            thisProc == "com.google.android.gms.persistent" ||
+            thisProc == "com.google.android.gms.ui";
 
         env->ReleaseStringUTFChars(args->nice_name, rawProcess);
         env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
 
         if (!isGms) {
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            // api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
         // We are in GMS now, force unmount
         api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
 
-        if (!isGmsUnstable && !isGmsParentOrPersistent) {
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+        if (!isGmsUnstable) {
+            // api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
@@ -197,9 +226,12 @@ public:
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
+        doConstUnameHook();
+
+        if (!isGms) return;
         if (json.empty()) return;
         readJson();
-        doUnameHook();
+        // doUnameHook();
 
         if (thisProc == "com.google.android.gms.unstable") {
             if (dexVector.empty()) return;
