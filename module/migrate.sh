@@ -15,7 +15,7 @@ esac;
 
 item() { echo "- $@"; }
 die() { [ "$INSTALL" ] || echo "$N$N! $@"; exit 1; }
-grep_get_json() { cat "$FILE" | tr -d '\r\n' | grep -m1 -owE "$1"'"[^,}]+"' | cut -d\" -f3; }
+grep_get_json() { cat "$FILE" | grep -oEm1 '"'"$1"'":[[:space:]]*".+",?' | sed -r 's/"'"$1"'":[[:space:]]*"(.+)",?/\1/g;s/(\\[\\"nrtbfu])/\\\\\1/g'; }
 grep_check_json() { grep -q "$1" "$FILE" && [ "$(grep_get_json $1)" ]; }
 
 case "$1" in
@@ -59,7 +59,7 @@ fi;
 
 if [ -z "$ID" ] && grep_check_json BUILD_ID; then
   item 'Deprecated entry BUILD_ID found, changing to ID field and "*.build.id" property ...';
-  ID="$(grep_get_json BUILD_ID)";
+  eval ID=\"$(grep_get_json BUILD_ID)\";
 fi;
 
 if [ -n "$SECURITY_PATCH" ] && ! grep_check_json security_patch; then
@@ -68,7 +68,7 @@ fi;
 
 if grep_check_json VNDK_VERSION; then
   item 'Deprecated entry VNDK_VERSION found, changing to "*.vndk.version" property ...';
-  VNDK_VERSION="$(grep_get_json VNDK_VERSION)";
+  eval VNDK_VERSION=\"$(grep_get_json VNDK_VERSION)\";
 fi;
 
 if [ -n "$DEVICE_INITIAL_SDK_INT" ] && ! grep_check_json api_level; then
@@ -77,7 +77,7 @@ fi;
 
 if [ -z "$DEVICE_INITIAL_SDK_INT" ] && grep_check_json FIRST_API_LEVEL; then
   item 'Deprecated entry FIRST_API_LEVEL found, changing to DEVICE_INITIAL_SDK_INT field and "*api_level" property ...';
-  DEVICE_INITIAL_SDK_INT="$(grep_get_json FIRST_API_LEVEL)";
+  eval DEVICE_INITIAL_SDK_INT=\"$(grep_get_json FIRST_API_LEVEL)\";
 fi;
 
 if [ -z "$RELEASE" -o -z "$INCREMENTAL" -o -z "$TYPE" -o -z "$TAGS" ]; then
